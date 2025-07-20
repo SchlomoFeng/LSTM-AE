@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 import os
+import json
+import s3fs
+fs = s3fs.S3FileSystem()
+import dill
+import tempfile
+
 import pandas as pd
 import numpy as np
-import json
-import pickle
 from datetime import datetime
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler,RobustScaler
+# import pickle
+
 import tensorflow as tf
 from keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
 from keras.models import Model, load_model
 from keras import regularizers
-import warnings
 
+import warnings
 warnings.filterwarnings('ignore')
 
 # 设置随机种子
@@ -30,7 +36,7 @@ class LSTMAEWarningSystem:
     def load_data(self):
         """加载数据并进行预处理"""
         try:
-            data = pd.read_csv('Dataset/气化一期S4_imputed.csv')
+            data = pd.read_csv(fs.open('data/气化一期S4_imputed.csv','rb'))
             data['timestamp'] = pd.to_datetime(data['timestamp'])
             data.index = data['timestamp']
             total_data = data.loc[:, "YT.11FI_02044.PV":"YT.11TI_02044.PV"]
@@ -97,12 +103,25 @@ class LSTMAEWarningSystem:
 
     def save_model_components(self):
         """保存模型、标准化器和阈值"""
-        model_dir = 'model'
+        model_dir = '/data'
         os.makedirs(model_dir, exist_ok=True)
 
         # 保存Keras模型
         model_path = os.path.join(model_dir, f'lstm_ae_{self.warningItemId}.h5')
-        self.model.save(model_path)
+
+        # 本地文件系统 → 临时文件 → S3存储
+        # 使用临时文件保存模型到S3
+        with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp_file:
+            try:
+                self.model.save(tmp_file.name)
+
+                # 上传到S3
+                with open(tmp_file.name, 'rb') as local_file:
+                    with fs.open(model_path, 'wb') as s3_file:
+                        s3_file.write(local_file.read())
+            finally:
+                if os.path.exists(tmp_file.name):
+                    os.unlink(tmp_file.name)
 
         # 保存标准化器和阈值
         components_path = os.path.join(model_dir, f'components_{self.warningItemId}.pkl')
@@ -111,33 +130,46 @@ class LSTMAEWarningSystem:
             'threshold': self.threshold,
             'feature_columns': self.feature_columns
         }
-        with open(components_path, 'wb') as f:
-            pickle.dump(components, f)
+        with fs.open(components_path, 'wb') as s:
+            dill.dump(components, s)
 
         print(f"模型组件已保存到: {model_path} 和 {components_path}")
 
     def load_model_components(self):
         """加载模型、标准化器和阈值"""
-        model_dir = 'model'
+        model_dir = '/data'
         model_path = os.path.join(model_dir, f'lstm_ae_{self.warningItemId}.h5')
         components_path = os.path.join(model_dir, f'components_{self.warningItemId}.pkl')
 
-        if os.path.exists(model_path) and os.path.exists(components_path):
-            # 加载Keras模型
-            self.model = load_model(model_path)
+        try:
+            if fs.exists(model_path) and fs.exists(components_path):
+                # 加载Keras模型
+                with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp_file:
+                    try:
+                        with fs.open(model_path, 'rb') as s3_file:
+                            tmp_file.write(s3_file.read())
 
-            # 加载标准化器和阈值
-            with open(components_path, 'rb') as f:
-                components = pickle.load(f)
+                        tmp_file.flush()
+                        self.model = load_model(tmp_file.name)
+                    finally:
+                        if os.path.exists(tmp_file.name):
+                            os.unlink(tmp_file.name)
 
-            self.scaler = components['scaler']
-            self.threshold = components['threshold']
-            self.feature_columns = components['feature_columns']
+                # 加载标准化器和阈值
+                with fs.open(components_path, 'rb') as s:
+                    components = dill.load(s)
 
-            print("模型组件加载成功")
-            return True
-        else:
-            print("未找到已保存的模型组件")
+                self.scaler = components['scaler']
+                self.threshold = components['threshold']
+                self.feature_columns = components['feature_columns']
+
+                print("模型组件从S3加载成功")
+                return True
+            else:
+                print("S3中未找到已保存的模型组件")
+                return False
+        except Exception as e:
+            print(f"从S3加载模型组件失败: {e}")
             return False
 
     def train_model(self, train_data):
@@ -249,11 +281,7 @@ def main(warningItemId: str, is_backtest: bool = True, test_time: dict = None,
 
         # 使用测试数据进行异常检测
         is_anomaly, anomaly_score, mae_loss = warning_system.detect_anomaly(test_data)
-        #print("test_samples:", len(test_data))
-        #print("\nanomaly_count:", np.sum(is_anomaly))
-        #print("\nanomaly_rate:", np.mean(is_anomaly))
-        #print("\navg_reconstruction_error:", np.mean(mae_loss))
-        #print("\nthreshold:", warning_system.threshold)
+
         # 生成追溯结果
         backtest_results = []
         for i, (timestamp, row) in enumerate(test_data.iterrows()):
@@ -262,9 +290,9 @@ def main(warningItemId: str, is_backtest: bool = True, test_time: dict = None,
                 warning_reason = f"重构误差异常: {mae_loss[i]:.4f}" if is_anomaly[i] else "正常"
 
                 warning_result = {
-                    "warningItemId": warningItemId,
-                    "warningTime": timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                    "warningStatus": warning_status,
+                    "warningItemId": warningItemId,                         # 预警项ID（必需）
+                    "warningTime": timestamp.strftime('%Y-%m-%d %H:%M:%S'), # 预警时间（必需）
+                    "warningStatus": warning_status,                        # 预警状态（必需）
                     "warningReason": warning_reason,
                     "warningTags": ",".join(warning_system.feature_columns),
                     "otherInfo": f"异常得分: {anomaly_score[i]:.4f}",
